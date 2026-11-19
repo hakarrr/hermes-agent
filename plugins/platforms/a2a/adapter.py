@@ -562,9 +562,9 @@ class A2AAdapter(BasePlatformAdapter):
 
     def _end_task(self, rec: dict, state: str, text: str, stored_reply: str = "") -> tuple[dict, None]:
         """Complete a task immediately (rejected / not ready) and build its terminal Task."""
-        self.tasks.complete(rec["task_id"], state, stored_reply)
+        completed = self.tasks.complete(rec["task_id"], state, stored_reply) or rec
         protocol.metrics.tasks_failed += state == protocol.STATE_FAILED
-        return protocol.build_task(rec["task_id"], rec["context_id"], state, text, created_at=rec["created_iso"]), None
+        return protocol.TaskStore.to_task({**completed, "reply": text}), None
 
     def _prepare_task(self, params: dict, peer: str, agent: Optional[dict] = None) -> tuple[Optional[dict], Optional[dict]]:
         """Validate, register, and dispatch an inbound message (HTTP worker thread). Returns
@@ -611,7 +611,7 @@ class A2AAdapter(BasePlatformAdapter):
             try:
                 reply, state = self._forward_to_profile(agent, peer, context_id, framed, input_id=input_id or task_id)
                 self._record_outcome(task_id, context_id, peer, state, reply)
-                return protocol.build_task(task_id, context_id, state, reply, created_at=rec["created_iso"]), None
+                return self._task_view(task_id, context_id, state, reply), None
             finally:
                 self._pop_pending(task_id)
         if self._loop is None or self._message_handler is None:
@@ -710,7 +710,7 @@ class A2AAdapter(BasePlatformAdapter):
         task, pending = self._prepare_task(params, peer, agent=agent)
         if task is None:
             state, reply = self._finalize_task(pending, *self._await_reply(pending))
-            task = protocol.build_task(pending["task_id"], pending["context_id"], state, reply, created_at=pending["created_iso"])
+            task = self._task_view(pending["task_id"], pending["context_id"], state, reply)
         return _ok(req_id, protocol.send_message_response(task) if v1_response else task)
 
     @staticmethod
@@ -730,12 +730,22 @@ class A2AAdapter(BasePlatformAdapter):
     def _keepalive(cls, handler):
         return lambda: cls._sse_write(handler, ": keepalive\n\n")
 
+    def _task_view(self, task_id: str, context_id: str, state: str, reply: str) -> dict:
+        """Use the recorded metadata for every transport, including stream replay."""
+        rec = self.tasks.get(task_id)
+        return protocol.TaskStore.to_task({**rec, "reply": reply}) if rec else protocol.build_task(task_id, context_id, state, reply)
+
     def _emit_terminal(self, handler, task_id: str, context_id: str, state: str, reply: str, req_id: Any = None) -> None:
         """Emit the final artifact/status events and the closure marker. ``req_id`` threads into the
         JSON-RPC SSE envelope (§9.4)."""
+        task = self._task_view(task_id, context_id, state, reply)
+        status = dict(task["status"])
         completed = bool(reply) and state == protocol.STATE_COMPLETED
-        events = ([protocol.artifact_update(task_id, context_id, reply)] if completed else []) + [
-            protocol.status_update(task_id, context_id, state, "" if completed else reply)]
+        if completed:
+            status.pop("message", None)
+        events = ([{"artifactUpdate": {"taskId": task_id, "contextId": context_id,
+                                        "artifact": task["artifacts"][0]}}] if completed else []) + [
+            {"statusUpdate": {"taskId": task_id, "contextId": context_id, "status": status}}]
         for ev in events:
             self._sse_write(handler, protocol.sse_data(ev, req_id))
         self._sse_write(handler, protocol.sse_done())
@@ -751,9 +761,12 @@ class A2AAdapter(BasePlatformAdapter):
                 return self._emit_terminal(handler, terminal["id"], terminal["contextId"], terminal["status"]["state"],
                                            protocol.extract_text(terminal.get("status", {}).get("message", {}) or {}), req_id=req_id)
             task_id, context_id = pending["task_id"], pending["context_id"]
-            submitted = protocol.build_task(task_id, context_id, protocol.STATE_SUBMITTED, created_at=pending["created_iso"])
+            submitted = protocol.build_task(task_id, context_id, protocol.STATE_SUBMITTED,
+                                            status_timestamp=pending["created_iso"])
             self._sse_write(handler, protocol.sse_data(protocol.stream_task(submitted), req_id))
-            self._sse_write(handler, protocol.sse_data(protocol.status_update(task_id, context_id, protocol.STATE_WORKING), req_id))
+            working = self._task_view(task_id, context_id, protocol.STATE_WORKING, "")["status"]
+            self._sse_write(handler, protocol.sse_data({"statusUpdate": {
+                "taskId": task_id, "contextId": context_id, "status": working}}, req_id))
             state, reply = self._finalize_task(pending, *self._await_reply(pending, keepalive=self._keepalive(handler)))
             pending = None
             self._emit_terminal(handler, task_id, context_id, state, reply, req_id=req_id)
@@ -857,7 +870,10 @@ class A2AAdapter(BasePlatformAdapter):
         scope, localhost_mode = self._scope_ctx.copy(), self._security_context.localhost_only()
         if not scope.run(security.is_safe_callback_url, callback_url, localhost_mode=localhost_mode):
             return fail("blocked — unsafe callback URL: %s", callback_url)
-        payload = protocol.status_update(task_id, context_id, state, (reply or "")[:2000])
+        status = self._task_view(task_id, context_id, state, reply)["status"]
+        if "message" in status:
+            status["message"]["parts"] = [protocol.text_part((reply or "")[:2000])]
+        payload = {"statusUpdate": {"taskId": task_id, "contextId": context_id, "status": status}}
         headers = {"Content-Type": "application/json"}
         if signature := self._security_context.sign_push_payload(payload):
             headers["X-A2A-Signature"] = signature
